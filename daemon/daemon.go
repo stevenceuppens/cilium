@@ -102,7 +102,7 @@ type Daemon struct {
 	events            chan events.Event
 	ipamConf          *ipam.IPAMConfig
 	k8sClient         kubernetes.Interface
-	l7Proxy           *proxy.Proxy
+	l7Proxy           proxy.Proxy
 	loadBalancer      *types.LoadBalancer
 	loopbackIPv4      net.IP
 	policy            *policy.Repository

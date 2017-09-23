@@ -31,6 +31,7 @@ import (
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/nodeaddress"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 
 	"github.com/braintree/manners"
@@ -61,7 +62,7 @@ type Redirect struct {
 	FromPort uint16
 	ToPort   uint16
 	epID     uint64
-	Rules    []policy.AuxRule
+	Rules    []string
 	source   ProxySource
 	server   *manners.GracefulServer
 	router   route.Router
@@ -80,16 +81,16 @@ func (r *Redirect) GetMagicMark() int {
 	return magicMarkEgress
 }
 
-func (r *Redirect) updateRules(rules []policy.AuxRule) {
+func (r *Redirect) updateRules(rules []string) {
 	for _, v := range r.Rules {
-		r.router.RemoveRoute(v.Expr)
+		r.router.RemoveRoute(v)
 	}
 
-	r.Rules = make([]policy.AuxRule, len(rules))
+	r.Rules = make([]string, len(rules))
 	copy(r.Rules, rules)
 
 	for _, v := range r.Rules {
-		r.router.AddRoute(v.Expr, v)
+		r.router.AddRoute(v, v)
 	}
 }
 
@@ -105,7 +106,12 @@ type ProxySource interface {
 	RUnlock()
 }
 
-type Proxy struct {
+type Proxy interface {
+	CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source ProxySource) (*Redirect, error)
+	RemoveRedirect(id string) error
+}
+
+type OxyProxy struct {
 	// mutex is the lock required when modifying any proxy datastructure
 	mutex sync.RWMutex
 
@@ -129,8 +135,8 @@ type Proxy struct {
 	redirects map[string]*Redirect
 }
 
-func NewProxy(minPort uint16, maxPort uint16) *Proxy {
-	return &Proxy{
+func NewProxy(minPort uint16, maxPort uint16) Proxy {
+	return &OxyProxy{
 		rangeMin:       minPort,
 		rangeMax:       maxPort,
 		nextPort:       minPort,
@@ -139,7 +145,7 @@ func NewProxy(minPort uint16, maxPort uint16) *Proxy {
 	}
 }
 
-func (p *Proxy) allocatePort() (uint16, error) {
+func (p *OxyProxy) allocatePort() (uint16, error) {
 	port := p.nextPort
 
 	for {
@@ -385,6 +391,46 @@ func setSocketMark(c net.Conn, mark int) {
 	}
 }
 
+func (p *OxyProxy) translatePolicyRule(h api.PortRuleHTTP) string {
+	var r string
+
+	if h.Path != "" {
+		r = "PathRegexp(\"" + h.Path + "\")"
+	}
+
+	if h.Method != "" {
+		if r != "" {
+			r += " && "
+		}
+		r += "MethodRegexp(\"" + h.Method + "\")"
+	}
+
+	if h.Host != "" {
+		if r != "" {
+			r += " && "
+		}
+		r += "HostRegexp(\"" + h.Host + "\")"
+	}
+
+	for _, hdr := range h.Headers {
+		s := strings.SplitN(hdr, " ", 2)
+		if r != "" {
+			r += " && "
+		}
+		r += "Header(\""
+		if len(s) == 2 {
+			// Remove ':' in "X-Key: true"
+			key := strings.TrimRight(s[0], ":")
+			r += key + "\",\"" + s[1]
+		} else {
+			r += s[0]
+		}
+		r += "\")"
+	}
+
+	return r
+}
+
 func listenSocket(address string, mark int) (net.Listener, error) {
 	addr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
@@ -433,7 +479,7 @@ func listenSocket(address string, mark int) (net.Listener, error) {
 // proxy configuration. This will allocate a proxy port as required and launch
 // a proxy instance. If the redirect is already in place, only the rules will be
 // updated.
-func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source ProxySource) (*Redirect, error) {
+func (p *OxyProxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source ProxySource) (*Redirect, error) {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           ciliumDialer,
@@ -452,10 +498,14 @@ func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source Pr
 		return nil, fmt.Errorf("unknown L7 protocol \"%s\"", l4.L7Parser)
 	}
 
+	var l7rules []string
 	for _, r := range l4.L7Rules {
-		if !route.IsValid(r.Expr) {
-			return nil, fmt.Errorf("invalid filter expression: %s", r.Expr)
+		expr := p.translatePolicyRule(r.HTTP)
+
+		if !route.IsValid(expr) {
+			return nil, fmt.Errorf("invalid filter expression: %s", expr)
 		}
+		l7rules = append(l7rules, expr)
 	}
 
 	gcOnce.Do(func() {
@@ -484,7 +534,7 @@ func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source Pr
 	p.mutex.Lock()
 
 	if r, ok := p.redirects[id]; ok {
-		r.updateRules(l4.L7Rules)
+		r.updateRules(l7rules)
 		log.Debugf("updated existing proxy instance %+v", r)
 		p.mutex.Unlock()
 		return r, nil
@@ -591,7 +641,7 @@ func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source Pr
 		ReadTimeout: 120 * time.Second,
 	})
 
-	redir.updateRules(l4.L7Rules)
+	redir.updateRules(l7rules)
 	p.allocatedPorts[to] = redir
 	p.redirects[id] = redir
 
@@ -633,7 +683,7 @@ func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source Pr
 	return redir, nil
 }
 
-func (p *Proxy) RemoveRedirect(id string) error {
+func (p *OxyProxy) RemoveRedirect(id string) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	r, ok := p.redirects[id]

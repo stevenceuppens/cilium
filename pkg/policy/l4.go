@@ -25,7 +25,7 @@ import (
 )
 
 type AuxRule struct {
-	Expr string `json:"expr"`
+	HTTP api.PortRuleHTTP `json:"http"`
 }
 
 type L4Filter struct {
@@ -61,45 +61,7 @@ func CreateL4Filter(rule api.PortRule, port api.PortProtocol, direction string, 
 	if rule.Rules != nil {
 		l7rules := []AuxRule{}
 		for _, h := range rule.Rules.HTTP {
-			r := AuxRule{}
-
-			if h.Path != "" {
-				r.Expr = "PathRegexp(\"" + h.Path + "\")"
-			}
-
-			if h.Method != "" {
-				if r.Expr != "" {
-					r.Expr += " && "
-				}
-				r.Expr += "MethodRegexp(\"" + h.Method + "\")"
-			}
-
-			if h.Host != "" {
-				if r.Expr != "" {
-					r.Expr += " && "
-				}
-				r.Expr += "HostRegexp(\"" + h.Host + "\")"
-			}
-
-			for _, hdr := range h.Headers {
-				s := strings.SplitN(hdr, " ", 2)
-				if r.Expr != "" {
-					r.Expr += " && "
-				}
-				r.Expr += "Header(\""
-				if len(s) == 2 {
-					// Remove ':' in "X-Key: true"
-					key := strings.TrimRight(s[0], ":")
-					r.Expr += key + "\",\"" + s[1]
-				} else {
-					r.Expr += s[0]
-				}
-				r.Expr += "\")"
-			}
-
-			if r.Expr != "" {
-				l7rules = append(l7rules, r)
-			}
+			l7rules = append(l7rules, AuxRule{HTTP: h})
 		}
 
 		if len(l7rules) > 0 {
